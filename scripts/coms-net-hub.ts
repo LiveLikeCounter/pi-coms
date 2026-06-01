@@ -113,8 +113,8 @@ function onMessage(raw: string, conn: net.Socket, bound: Bound) {
 
   switch (m.t) {
     case "register": {
-      if (!takeToken(bound)) { audit(`RATE-LIMIT ${bound.name ?? "?"} register`); return; }
       if (typeof m.name !== "string" || !m.name) return;
+      if (!takeToken(bound)) { audit(`RATE-LIMIT ${m.name} register`); return; }
       const record: PeerRecord = {
         name: m.name, model: m.model ?? "unknown", purpose: m.purpose ?? "",
         color: m.color ?? "#36F9F6", pid: m.pid ?? 0,
@@ -140,12 +140,19 @@ function onMessage(raw: string, conn: net.Socket, bound: Bound) {
       break;
     }
     case "send": {
-      if (!takeToken(bound)) { audit(`RATE-LIMIT ${bound.name ?? "?"} send`); return; }
       if (!MSG_ID_RE.test(m.msg_id ?? "") || typeof m.from !== "string" || typeof m.to !== "string" || typeof m.text !== "string") {
         audit(`REJECT malformed send from ${String(m.from)}`);
         return;
       }
-      const hops = (m.hops ?? 1) as number;
+      // a client may only send as its own registered identity (anti-spoofing)
+      if (!bound.name || m.from !== bound.name) { audit(`REJECT send from=${m.from} bound=${bound.name ?? "?"}`); return; }
+      if (!takeToken(bound)) {
+        // surface the drop so the sender's await resolves instead of hanging to its timeout
+        audit(`RATE-LIMIT ${bound.name} send`);
+        sendToClient(m.from, { t: "response", msg_id: m.msg_id, from: m.to, text: "Dropped: hub rate limit exceeded", isError: true });
+        return;
+      }
+      const hops = Number.isSafeInteger(m.hops) && m.hops >= 1 ? m.hops : 1;
       if (hops > MAX_HOPS) {
         audit(`DROP ${m.msg_id} ${m.from}->${m.to} hops=${hops}`);
         sendToClient(m.from, { t: "response", msg_id: m.msg_id, from: m.to, text: `Dropped: hop limit ${MAX_HOPS} exceeded`, isError: true });
@@ -163,6 +170,8 @@ function onMessage(raw: string, conn: net.Socket, bound: Bound) {
         audit(`REJECT malformed reply from ${String(m.from)}`);
         return;
       }
+      // a client may only reply as its own registered identity (anti-spoofing)
+      if (!bound.name || m.from !== bound.name) { audit(`REJECT reply from=${m.from} bound=${bound.name ?? "?"}`); return; }
       audit(`REPLY ${m.msg_id} ${m.from}->${m.to}${m.isError ? " ERR" : ""}`);
       sendToClient(m.to, { t: "response", msg_id: m.msg_id, from: m.from, text: m.text, isError: m.isError });
       break;
@@ -177,16 +186,16 @@ const server = net.createServer((conn) => {
   let buf = "";
   conn.on("data", (chunk) => {
     buf += chunk.toString("utf8");
-    if (buf.length > MAX_MESSAGE_BYTES) {
-      audit(`DROP oversized frame from ${bound.name ?? "?"} (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
-      buf = "";
-      try { conn.destroy(); } catch { /* */ }
-      return;
-    }
     let nl: number;
     while ((nl = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
       if (line.trim()) onMessage(line, conn, bound);
+    }
+    // Consume complete frames first; only an oversized un-framed remainder is the DoS case.
+    if (buf.length > MAX_MESSAGE_BYTES) {
+      audit(`DROP oversized frame from ${bound.name ?? "?"} (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+      buf = "";
+      try { conn.destroy(); } catch { /* */ }
     }
   });
   const drop = () => {

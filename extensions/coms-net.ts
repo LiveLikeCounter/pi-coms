@@ -108,13 +108,21 @@ export default function (pi: ExtensionAPI) {
   // Read a payload_file for coms_net_send, confined to the project dir and size-capped,
   // so a peer-steered prompt can't make this agent read arbitrary local files.
   function readPayloadFile(cwd: string, spec: string): string {
-    const root = path.resolve(cwd);
-    const abs = path.resolve(root, spec.replace(/^@/, ""));
-    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
-      throw new Error(`payload_file must be inside the project dir (${root}). Set PI_COMS_NET_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.`);
+    // realpath BOTH sides so a symlink inside cwd can't redirect the read outside it.
+    let root: string;
+    let abs: string;
+    try {
+      root = fs.realpathSync(path.resolve(cwd));
+      abs = fs.realpathSync(path.resolve(root, spec.replace(/^@/, "")));
+    } catch {
+      throw new Error("payload_file not found or unreadable.");
     }
-    const size = fs.statSync(abs).size;
-    if (size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit)`);
+    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
+      throw new Error("payload_file must be inside the project directory. Set PI_COMS_NET_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.");
+    }
+    const st = fs.statSync(abs);
+    if (!st.isFile()) throw new Error("payload_file must be a regular file.");
+    if (st.size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${st.size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit).`);
     return fs.readFileSync(abs, "utf8");
   }
   function tokens(): { tokens: number; contextWindow: number } {
@@ -145,16 +153,16 @@ export default function (pi: ExtensionAPI) {
     let buf = "";
     hub.on("data", (chunk) => {
       buf += chunk.toString("utf8");
-      if (buf.length > MAX_MESSAGE_BYTES) {
-        audit(`DROP oversized frame from hub (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
-        buf = "";
-        try { hub?.destroy(); } catch { /* */ }
-        return;
-      }
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
         if (line.trim()) onHubMessage(line, ctx);
+      }
+      // Consume complete frames first; only an oversized un-framed remainder is a problem.
+      if (buf.length > MAX_MESSAGE_BYTES) {
+        audit(`DROP oversized frame from hub (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+        buf = "";
+        try { hub?.destroy(); } catch { /* */ }
       }
     });
     const lost = () => {
@@ -192,7 +200,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (inbound.size >= MAX_INBOUND && !inbound.has(m.msg_id)) evictOldestInbound();
-      inbound.set(m.msg_id, { from: m.from, hops: typeof m.hops === "number" ? m.hops : 1, ts: Date.now() });
+      inbound.set(m.msg_id, { from: m.from, hops: Number.isSafeInteger(m.hops) && m.hops >= 1 ? m.hops : 1, ts: Date.now() });
       audit(`RECV ${m.msg_id} ${m.from}->${selfName} hops=${m.hops}`);
       const wrapped =
         `[coms-net] Message from peer "${m.from}". Your reply will be sent back to them automatically.\n\n` +
@@ -200,6 +208,7 @@ export default function (pi: ExtensionAPI) {
       pi.sendUserMessage(wrapped, { deliverAs: "followUp" });
     } else if (m.t === "response") {
       // reply to something we sent
+      if (!MSG_ID_RE.test(m.msg_id ?? "")) return;
       const p = pending.get(m.msg_id);
       audit(`REPLY ${m.msg_id} ${m.from}->${selfName}${m.isError ? " ERR" : ""}`);
       if (p) {

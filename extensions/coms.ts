@@ -167,13 +167,22 @@ export default function (pi: ExtensionAPI) {
   // Read a payload_file for coms_send, confined to the project dir and size-capped.
   // Without this an LLM steered by a peer's prompt could read arbitrary local files.
   function readPayloadFile(cwd: string, spec: string): string {
-    const root = path.resolve(cwd);
-    const abs = path.resolve(root, spec.replace(/^@/, ""));
-    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
-      throw new Error(`payload_file must be inside the project dir (${root}). Set PI_COMS_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.`);
+    // realpath BOTH sides so a symlink inside cwd can't point the read outside it
+    // (path.resolve alone doesn't follow links), and so a symlinked cwd still matches.
+    let root: string;
+    let abs: string;
+    try {
+      root = fs.realpathSync(path.resolve(cwd));
+      abs = fs.realpathSync(path.resolve(root, spec.replace(/^@/, "")));
+    } catch {
+      throw new Error("payload_file not found or unreadable.");
     }
-    const size = fs.statSync(abs).size;
-    if (size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit)`);
+    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
+      throw new Error("payload_file must be inside the project directory. Set PI_COMS_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.");
+    }
+    const st = fs.statSync(abs);
+    if (!st.isFile()) throw new Error("payload_file must be a regular file.");
+    if (st.size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${st.size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit).`);
     return fs.readFileSync(abs, "utf8");
   }
 
@@ -204,17 +213,18 @@ export default function (pi: ExtensionAPI) {
       let buf = "";
       sock.on("data", (chunk) => {
         buf += chunk.toString("utf8");
-        if (buf.length > MAX_MESSAGE_BYTES) {
-          audit(`DROP oversized frame (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
-          buf = "";
-          try { sock.destroy(); } catch { /* */ }
-          return;
-        }
         let nl: number;
         while ((nl = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
           if (line.trim()) handleEnvelope(line, sock);
+        }
+        // Consume complete frames first; only an oversized UNFRAMED remainder
+        // (a single line with no newline) is the memory-exhaustion case.
+        if (buf.length > MAX_MESSAGE_BYTES) {
+          audit(`DROP oversized frame (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+          buf = "";
+          try { sock.destroy(); } catch { /* */ }
         }
       });
       sock.on("error", () => { /* peer vanished mid-stream */ });
@@ -233,7 +243,7 @@ export default function (pi: ExtensionAPI) {
     if (env.type === "prompt") {
       // ---- we are the receiver ----
       // Reject malformed envelopes before they touch the maps or the followUp queue.
-      if (!MSG_ID_RE.test(env.msg_id ?? "") || typeof env.from !== "string" || typeof env.text !== "string" || typeof env.hops !== "number") {
+      if (!MSG_ID_RE.test(env.msg_id ?? "") || typeof env.from !== "string" || typeof env.text !== "string" || !Number.isSafeInteger(env.hops) || env.hops < 1) {
         audit(`REJECT malformed prompt from ${String(env.from)}`);
         return;
       }
@@ -255,10 +265,12 @@ export default function (pi: ExtensionAPI) {
       // followUp: queue until idle so it becomes the next processed prompt
       pi.sendUserMessage(wrapped, { deliverAs: "followUp" });
     } else if (env.type === "ack") {
+      if (!MSG_ID_RE.test(env.msg_id ?? "")) return;
       // handled inline by the sender's connection logic (see sendPrompt)
       pi.events.emit(`coms:ack:${env.msg_id}`, {});
     } else if (env.type === "response") {
       // ---- we are the sender, reply has arrived ----
+      if (!MSG_ID_RE.test(env.msg_id ?? "")) return;
       audit(`REPLY ${env.msg_id} ${env.from}->${self!.name}${env.isError ? " ERR" : ""}`);
       const p = pending.get(env.msg_id);
       if (p) {
@@ -338,6 +350,8 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* ignore */ }
         }
+        // a peer we dialed can't stream an unbounded un-framed ack reply
+        if (cbuf.length > MAX_MESSAGE_BYTES) { cbuf = ""; try { c.destroy(); } catch { /* */ } }
       });
       c.on("error", (err) => { clearTimeout(ackTimer); reject(err); });
     });
