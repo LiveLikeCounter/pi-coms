@@ -112,8 +112,8 @@ Runtime state lives outside the repo under `~/.pi/coms/` and `~/.pi/coms-net/pro
 ## Limitations (v1)
 
 - **Same machine only.** Both tiers use Unix sockets. The wire protocol is transport-agnostic: to go cross-device, swap the hub's `net.createServer({ path })` for a TCP/TLS listener plus a token check — clients and tools are unchanged.
-- **Hop tracking** enforces the ceiling on receive and sends with `hops=1`; deep auto-forward accounting isn't wired up.
-- **Reply correlation** uses the visible `(coms-id: …)` wrapper described above.
+- **Hop tracking** propagates: a send made while handling forwarded prompt(s) inherits the inbound hop count + 1, so forward chains eventually trip the ceiling. It tracks in-flight inbound depth rather than a precise per-message path.
+- **Reply correlation** uses the visible `(coms-id: …)` wrapper described above; replies are paired to askers by position within the turn, so several concurrent inbound prompts (e.g. a broadcast) each get their own answer.
 
 ## License
 

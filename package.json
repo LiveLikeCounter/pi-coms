@@ -21,13 +21,13 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": "^0.73.1"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "latest",
-    "@mariozechner/pi-coding-agent": "latest",
-    "@sinclair/typebox": "latest",
-    "@types/node": "latest",
-    "typescript": "latest"
+    "@mariozechner/pi-ai": "0.73.1",
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@sinclair/typebox": "0.34.49",
+    "@types/node": "25.9.1",
+    "typescript": "6.0.3"
   }
 }
