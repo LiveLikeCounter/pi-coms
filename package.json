@@ -1,0 +1,33 @@
+{
+  "name": "pi-coms",
+  "version": "0.1.0",
+  "description": "Agent-to-agent communication for the Pi coding agent: flat peer-to-peer (coms) and hub-and-spoke (coms-net), local-first over Unix sockets.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/coms.ts",
+      "./extensions/coms-net.ts"
+    ]
+  },
+  "scripts": {
+    "hub": "bun scripts/coms-net-hub.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "latest",
+    "@mariozechner/pi-coding-agent": "latest",
+    "@sinclair/typebox": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
