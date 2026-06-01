@@ -90,6 +90,12 @@ Replies larger than `*_INLINE_LIMIT` bytes (default 6000) are written to `~/.pi/
 | `PI_COMS_MAX_HOPS` / `PI_COMS_NET_MAX_HOPS` | 5 | Drop prompts exceeding this hop count |
 | `PI_COMS_TIMEOUT_MS` / `PI_COMS_NET_TIMEOUT_MS` | 1800000 | Default `*_await` timeout |
 | `PI_COMS_INLINE_LIMIT` / `PI_COMS_NET_INLINE_LIMIT` | 6000 | Replies larger than this go to a file |
+| `PI_COMS_MAX_MESSAGE_BYTES` / `PI_COMS_NET_MAX_MESSAGE_BYTES` | 10485760 | Drop a connection whose un-framed line exceeds this |
+| `PI_COMS_MAX_INBOUND` / `PI_COMS_NET_MAX_INBOUND` | 1000 | Cap in-flight inbound prompts (evict oldest) |
+| `PI_COMS_INBOUND_TTL_MS` / `PI_COMS_NET_INBOUND_TTL_MS` | 3600000 | Expire inbound prompts never replied to |
+| `PI_COMS_PAYLOAD_FILE_MAX_BYTES` / `PI_COMS_NET_PAYLOAD_FILE_MAX_BYTES` | 10485760 | Max `payload_file` size |
+| `PI_COMS_ALLOW_PAYLOAD_OUTSIDE_CWD` / `PI_COMS_NET_ALLOW_PAYLOAD_OUTSIDE_CWD` | unset | Set to `1` to allow `payload_file` outside the project dir |
+| `PI_COMS_NET_RATE_BURST` / `PI_COMS_NET_RATE_REFILL` | 100 / 50 | Hub per-connection `send`/`register` token bucket (burst / refill-per-sec) |
 
 ## Project layout
 
@@ -113,7 +119,8 @@ Runtime state lives outside the repo under `~/.pi/coms/` and `~/.pi/coms-net/pro
 
 - **Same machine only.** Both tiers use Unix sockets. The wire protocol is transport-agnostic: to go cross-device, swap the hub's `net.createServer({ path })` for a TCP/TLS listener plus a token check — clients and tools are unchanged.
 - **Hop tracking** propagates: a send made while handling forwarded prompt(s) inherits the inbound hop count + 1, so forward chains eventually trip the ceiling. It tracks in-flight inbound depth rather than a precise per-message path.
-- **Reply correlation** uses the visible `(coms-id: …)` wrapper described above; replies are paired to askers by position within the turn, so several concurrent inbound prompts (e.g. a broadcast) each get their own answer.
+- **Reply correlation** uses the visible `(coms-id: …)` wrapper described above; replies are paired to askers by position within the turn (matching the wrapper's trailing marker on user messages only), so several concurrent inbound prompts (e.g. a broadcast) each get their own answer and a peer can't smuggle a marker to misroute one.
+- **Trust model.** Both tiers are gated only by OS file permissions on the socket — any local process that can open it is a peer. Inputs are hardened defensively (envelope/`msg_id` validation, per-connection frame-size cap and hub rate limit, bounded in-flight maps, `payload_file` confined to the project dir), but there is no authentication or per-peer authorization; run only in a trusted local session.
 
 ## License
 
