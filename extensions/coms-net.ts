@@ -170,32 +170,46 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, _ctx) => {
     if (inbound.size === 0) return;
     const messages = (event as any).messages ?? [];
-    let matchedId: string | undefined;
+
+    // Pair each inbound coms-id with the final assistant message that followed
+    // it, in order, so concurrent prompts (e.g. a broadcast fanning into one
+    // agent) don't cross-wire or get orphaned.
+    const replies: Array<{ id: string; text: string }> = [];
+    let curId: string | undefined;
+    let curText = "";
+    const flush = () => { if (curId) replies.push({ id: curId, text: curText }); curId = undefined; curText = ""; };
     for (const msg of messages) {
-      const found = extractText(msg).match(/\(coms-id:\s*(msg_[a-f0-9]+)\)/);
-      if (found && inbound.has(found[1])) { matchedId = found[1]; break; }
+      // The marker lives in the injected user message; ignore any assistant echo.
+      if (msg?.role !== "assistant") {
+        const marker = extractText(msg).match(/\(coms-id:\s*(msg_[a-f0-9]+)\)/);
+        if (marker && inbound.has(marker[1])) { flush(); curId = marker[1]; continue; }
+      }
+      if (curId && msg?.role === "assistant") {
+        const t = extractText(msg).trim();
+        if (t) curText = t; // keep the latest assistant text for this id
+      }
     }
-    if (!matchedId) return;
+    flush();
 
-    const rec = inbound.get(matchedId)!;
-    inbound.delete(matchedId);
+    for (const { id, text } of replies) {
+      const rec = inbound.get(id);
+      if (!rec) continue;
+      inbound.delete(id);
 
-    let replyText = "";
-    for (const msg of messages) if (msg?.role === "assistant") replyText = extractText(msg) || replyText;
-    replyText = replyText.trim() || "(no response)";
-
-    // file-only handoff for large replies (from pi-subagents)
-    let outText = replyText;
-    if (replyText.length > INLINE_REPLY_LIMIT) {
-      const payloadsDir = path.join(projectDir, "payloads");
-      try {
-        fs.mkdirSync(payloadsDir, { recursive: true });
-        const file = path.join(payloadsDir, `${matchedId}_reply.md`);
-        fs.writeFileSync(file, replyText);
-        outText = `Reply saved to: ${file} (${formatSize(replyText.length)}, ${replyText.split("\n").length} lines). Read this file for the full response.`;
-      } catch { /* fall back to inline */ }
+      const body = text.trim() || "(no response)";
+      // file-only handoff for large replies (from pi-subagents)
+      let outText = body;
+      if (body.length > INLINE_REPLY_LIMIT) {
+        const payloadsDir = path.join(projectDir, "payloads");
+        try {
+          fs.mkdirSync(payloadsDir, { recursive: true });
+          const file = path.join(payloadsDir, `${id}_reply.md`);
+          fs.writeFileSync(file, body);
+          outText = `Reply saved to: ${file} (${formatSize(body.length)}, ${body.split("\n").length} lines). Read this file for the full response.`;
+        } catch { /* fall back to inline */ }
+      }
+      send({ t: "reply", msg_id: id, from: selfName, to: rec.from, text: outText });
     }
-    send({ t: "reply", msg_id: matchedId, from: selfName, to: rec.from, text: outText });
   });
 
   function extractText(m: any): string {
@@ -211,11 +225,21 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ---- send helper -------------------------------------------------------
+  // Outgoing hop count: continue a forwarded chain (+1) while handling inbound
+  // prompt(s) so forward loops eventually trip MAX_HOPS at the hub; an
+  // agent-initiated send starts at 1. Tracks in-flight inbound depth, and only
+  // over-counts while unrelated inbound is briefly pending (fails safe).
+  function nextHops(): number {
+    let max = 0;
+    for (const rec of inbound.values()) if (rec.hops > max) max = rec.hops;
+    return max + 1;
+  }
+
   function routePrompt(target: string, text: string): string {
     if (!connected) throw new Error("Not connected to a coms-net hub. Start it with: bun coms-net-hub.ts");
     const msg_id = `msg_${crypto.randomBytes(5).toString("hex")}`;
     pending.set(msg_id, { status: "pending", resolvers: [] });
-    const ok = send({ t: "send", msg_id, from: selfName, to: target, hops: 1, text });
+    const ok = send({ t: "send", msg_id, from: selfName, to: target, hops: nextHops(), text });
     if (!ok) { pending.delete(msg_id); throw new Error("Failed to write to hub"); }
     audit(`SEND ${msg_id} ${selfName}->${target}`);
     return msg_id;

@@ -223,6 +223,17 @@ export default function (pi: ExtensionAPI) {
     return readPeers().find((p) => p.name === name);
   }
 
+  // Outgoing hop count. If we're currently handling forwarded inbound prompt(s),
+  // continue their chain (+1) so A->B->C->... eventually trips MAX_HOPS instead of
+  // looping forever; an agent-initiated send (no inbound in flight) starts at 1.
+  // This tracks in-flight inbound depth, not a precise per-message path, and only
+  // over-counts while unrelated inbound is briefly pending — which fails safe.
+  function nextHops(): number {
+    let max = 0;
+    for (const rec of inbound.values()) if (rec.hops > max) max = rec.hops;
+    return max + 1;
+  }
+
   // fire-and-forget delivery of an envelope to a named peer
   function sendTo(name: string, env: Envelope): Promise<void> {
     return new Promise((resolve) => {
@@ -286,37 +297,46 @@ export default function (pi: ExtensionAPI) {
     if (inbound.size === 0) return;
     const messages = (event as any).messages ?? [];
 
-    // find which coms-id this turn corresponds to
-    let matchedId: string | undefined;
+    // Pair each inbound coms-id with the final assistant message that followed
+    // it, walking the turn in order. A single agent run can carry several
+    // injected prompts (followUps processed back-to-back), so matching by
+    // position keeps each reply with its own asker instead of cross-wiring them
+    // or orphaning all but the first.
+    const replies: Array<{ id: string; text: string }> = [];
+    let curId: string | undefined;
+    let curText = "";
+    const flush = () => { if (curId) replies.push({ id: curId, text: curText }); curId = undefined; curText = ""; };
     for (const m of messages) {
-      const text = extractText(m);
-      const found = text.match(/\(coms-id:\s*(msg_[a-f0-9]+)\)/);
-      if (found && inbound.has(found[1])) { matchedId = found[1]; break; }
+      // The marker lives in the injected user message; ignore any assistant echo.
+      if (m?.role !== "assistant") {
+        const marker = extractText(m).match(/\(coms-id:\s*(msg_[a-f0-9]+)\)/);
+        if (marker && inbound.has(marker[1])) { flush(); curId = marker[1]; continue; }
+      }
+      if (curId && m?.role === "assistant") {
+        const t = extractText(m).trim();
+        if (t) curText = t; // keep the latest assistant text for this id
+      }
     }
-    if (!matchedId) return;
+    flush();
 
-    const rec = inbound.get(matchedId)!;
-    inbound.delete(matchedId);
+    for (const { id, text } of replies) {
+      const rec = inbound.get(id);
+      if (!rec) continue;
+      inbound.delete(id);
 
-    // final assistant text of this turn
-    let replyText = "";
-    for (const m of messages) {
-      if (m?.role === "assistant") replyText = extractText(m) || replyText;
+      const body = text.trim() || "(no response)";
+      // pi-subagents-style file-only handoff for large replies
+      let outText = body;
+      if (body.length > INLINE_REPLY_LIMIT) {
+        ensureDir(payloadsDir);
+        const file = path.join(payloadsDir, `${id}_reply.md`);
+        try {
+          fs.writeFileSync(file, body);
+          outText = `Reply saved to: ${file} (${formatSize(body.length)}, ${body.split("\n").length} lines). Read this file for the full response.`;
+        } catch { /* fall back to inline */ }
+      }
+      await sendTo(rec.from, { type: "response", msg_id: id, from: self!.name, text: outText });
     }
-    replyText = replyText.trim() || "(no response)";
-
-    // pi-subagents-style file-only handoff for large replies
-    let outText = replyText;
-    if (replyText.length > INLINE_REPLY_LIMIT) {
-      ensureDir(payloadsDir);
-      const file = path.join(payloadsDir, `${matchedId}_reply.md`);
-      try {
-        fs.writeFileSync(file, replyText);
-        outText = `Reply saved to: ${file} (${formatSize(replyText.length)}, ${replyText.split("\n").length} lines). Read this file for the full response.`;
-      } catch { /* fall back to inline */ }
-    }
-
-    await sendTo(rec.from, { type: "response", msg_id: matchedId, from: self!.name, text: outText });
   });
 
   function extractText(m: any): string {
@@ -397,7 +417,7 @@ export default function (pi: ExtensionAPI) {
         body = `${body ? body + "\n\n" : ""}${fs.readFileSync(abs, "utf8")}`;
       }
       if (!body.trim()) throw new Error("coms_send requires text or a non-empty payload_file");
-      const msg_id = await sendPrompt(params.target, body, 1);
+      const msg_id = await sendPrompt(params.target, body, nextHops());
       renderWidget(ctx);
       return { content: [{ type: "text", text: `Sent to ${params.target}. msg_id=${msg_id} (status: pending). Use coms_await("${msg_id}") to wait for the reply.` }], details: { msg_id, target: params.target } };
     },
