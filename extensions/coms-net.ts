@@ -173,29 +173,30 @@ export default function (pi: ExtensionAPI) {
 
     // Pair each inbound coms-id with the final assistant message that followed
     // it, in order, so concurrent prompts (e.g. a broadcast fanning into one
-    // agent) don't cross-wire or get orphaned.
-    const replies: Array<{ id: string; text: string }> = [];
-    let curId: string | undefined;
-    let curText = "";
-    const flush = () => { if (curId) replies.push({ id: curId, text: curText }); curId = undefined; curText = ""; };
+    // agent) don't cross-wire or get orphaned. Scan only user messages and take
+    // the LAST coms-id in each: the genuine marker is always our trailer, so a
+    // peer can't smuggle an earlier id to steal a concurrent reply and a tool
+    // echo can't spuriously flush. Reserve each entry (delete + capture `from`)
+    // during the scan so a re-entrant agent_end can't double-send.
+    const replies: Array<{ id: string; from: string; text: string }> = [];
+    let cur: { id: string; from: string; text: string } | null = null;
+    const flush = () => { if (cur) replies.push(cur); cur = null; };
     for (const msg of messages) {
-      // The marker lives in the injected user message; ignore any assistant echo.
-      if (msg?.role !== "assistant") {
-        const marker = extractText(msg).match(/\(coms-id:\s*(msg_[a-f0-9]+)\)/);
-        if (marker && inbound.has(marker[1])) { flush(); curId = marker[1]; continue; }
+      if (msg?.role === "user") {
+        const ids = [...extractText(msg).matchAll(/\(coms-id:\s*(msg_[a-f0-9]+)\)/g)];
+        const id = ids.at(-1)?.[1];
+        const rec = id ? inbound.get(id) : undefined;
+        // reserving (delete) means a repeated id yields rec===undefined next time, so no re-flush guard needed
+        if (id && rec) { flush(); inbound.delete(id); cur = { id, from: rec.from, text: "" }; continue; }
       }
-      if (curId && msg?.role === "assistant") {
+      if (cur && msg?.role === "assistant") {
         const t = extractText(msg).trim();
-        if (t) curText = t; // keep the latest assistant text for this id
+        if (t) cur.text = t; // keep the latest assistant text for this id
       }
     }
     flush();
 
-    for (const { id, text } of replies) {
-      const rec = inbound.get(id);
-      if (!rec) continue;
-      inbound.delete(id);
-
+    for (const { id, from, text } of replies) {
       const body = text.trim() || "(no response)";
       // file-only handoff for large replies (from pi-subagents)
       let outText = body;
@@ -208,7 +209,7 @@ export default function (pi: ExtensionAPI) {
           outText = `Reply saved to: ${file} (${formatSize(body.length)}, ${body.split("\n").length} lines). Read this file for the full response.`;
         } catch { /* fall back to inline */ }
       }
-      send({ t: "reply", msg_id: id, from: selfName, to: rec.from, text: outText });
+      send({ t: "reply", msg_id: id, from: selfName, to: from, text: outText });
     }
   });
 
