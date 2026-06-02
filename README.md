@@ -61,6 +61,25 @@ just net-coder         # terminal 3
 
 The hub terminal prints every routed message, so it doubles as your live audit view.
 
+## Specialized seats (personas)
+
+Beyond the generic `planner`/`coder` seats, the `justfile` ships five role-specialized seats. Each loads a persona from `personas/<role>.md` via Pi's `--append-system-prompt` and pins a model; the two reviewer seats also run with deep thinking and a restricted, no-edit tool set so they advise and delegate rather than touch code.
+
+| Seat | Role | Model | Tools |
+| --- | --- | --- | --- |
+| `developer` | Implements features & fixes | Sonnet | full |
+| `architect` | Designs & plans, no edits | Opus + high thinking | read/bash + `coms_*` |
+| `qa-engineer` | Writes & runs tests | Sonnet | full |
+| `security` | Adversarial review, no edits | Opus + high thinking | read/bash + `coms_*` |
+| `infra` | CI/CD, IaC, cloud, deploy | Sonnet | full |
+
+```bash
+just coms-developer    # peer-to-peer; or coms-architect / coms-qa / coms-security / coms-infra
+just net-developer     # same seats over the hub (start `just hub` first)
+```
+
+The reviewer recipes list the `coms_*` (or `coms_net_*`) tools explicitly in their `--tools` allowlist — `--tools` gates extension tools too, so omitting them would leave the seat unable to communicate. Edit a `personas/*.md` file to retune a role; all seats run in the same project directory.
+
 ## Tools
 
 Peer-to-peer (`coms.ts`) and hub (`coms-net.ts`) expose the same surface, prefixed `coms_` vs `coms_net_`:
@@ -106,6 +125,7 @@ pi-coms/
 │   └── coms-net.ts        # hub-client extension
 ├── scripts/
 │   └── coms-net-hub.ts    # standalone hub broker (run with bun)
+├── personas/              # role system-prompts for the specialized seats
 ├── package.json           # Pi manifest (pi.extensions) + dev types
 ├── justfile               # recipes
 ├── tsconfig.json
