@@ -40,6 +40,15 @@ const HEARTBEAT_MS = 10_000;
 const INLINE_REPLY_LIMIT = Number(process.env.PI_COMS_NET_INLINE_LIMIT ?? 6_000);
 const RECONNECT_MS = 3_000;
 
+// Hardening limits (all env-overridable) — mirror the peer-to-peer tier.
+const MAX_MESSAGE_BYTES = Number(process.env.PI_COMS_NET_MAX_MESSAGE_BYTES ?? 10 * 1024 * 1024);
+const MAX_INBOUND = Number(process.env.PI_COMS_NET_MAX_INBOUND ?? 1_000);
+const INBOUND_TTL_MS = Number(process.env.PI_COMS_NET_INBOUND_TTL_MS ?? 60 * 60 * 1000);
+const PAYLOAD_FILE_MAX_BYTES = Number(process.env.PI_COMS_NET_PAYLOAD_FILE_MAX_BYTES ?? 10 * 1024 * 1024);
+const ALLOW_PAYLOAD_OUTSIDE_CWD = process.env.PI_COMS_NET_ALLOW_PAYLOAD_OUTSIDE_CWD === "1";
+// We mint ids as "msg_" + 10 lowercase hex chars; reject anything else from the hub.
+const MSG_ID_RE = /^msg_[0-9a-f]{10}$/;
+
 interface PeerRecord {
   name: string; model: string; purpose: string; color: string;
   pid: number; tokens: number; contextWindow: number; ts: number;
@@ -67,7 +76,7 @@ export default function (pi: ExtensionAPI) {
 
   let peers: PeerRecord[] = [];
   const pending = new Map<string, Pending>();
-  const inbound = new Map<string, { from: string; hops: number }>();
+  const inbound = new Map<string, { from: string; hops: number; ts: number }>();
 
   pi.registerFlag("coms-name", { description: "Peer name in the coms-net pool", type: "string" });
   pi.registerFlag("coms-purpose", { description: "One-line role shown to peers", type: "string" });
@@ -81,6 +90,40 @@ export default function (pi: ExtensionAPI) {
   }
   function audit(line: string) {
     try { fs.appendFileSync(auditLog, `${new Date().toISOString()} ${line}\n`); } catch { /* */ }
+  }
+
+  // Expire inbound prompts never replied to within the TTL, and evict the oldest
+  // when at the size cap, so a peer can't grow `inbound` without bound.
+  function sweepInbound() {
+    const now = Date.now();
+    for (const [id, rec] of inbound) if (now - rec.ts > INBOUND_TTL_MS) { inbound.delete(id); audit(`EXPIRE ${id}`); }
+  }
+  function evictOldestInbound() {
+    let oldestId: string | undefined;
+    let oldestTs = Infinity;
+    for (const [id, rec] of inbound) if (rec.ts < oldestTs) { oldestTs = rec.ts; oldestId = id; }
+    if (oldestId) { inbound.delete(oldestId); audit(`EVICT ${oldestId} (inbound cap ${MAX_INBOUND})`); }
+  }
+
+  // Read a payload_file for coms_net_send, confined to the project dir and size-capped,
+  // so a peer-steered prompt can't make this agent read arbitrary local files.
+  function readPayloadFile(cwd: string, spec: string): string {
+    // realpath BOTH sides so a symlink inside cwd can't redirect the read outside it.
+    let root: string;
+    let abs: string;
+    try {
+      root = fs.realpathSync(path.resolve(cwd));
+      abs = fs.realpathSync(path.resolve(root, spec.replace(/^@/, "")));
+    } catch {
+      throw new Error("payload_file not found or unreadable.");
+    }
+    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
+      throw new Error("payload_file must be inside the project directory. Set PI_COMS_NET_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.");
+    }
+    const st = fs.statSync(abs);
+    if (!st.isFile()) throw new Error("payload_file must be a regular file.");
+    if (st.size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${st.size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit).`);
+    return fs.readFileSync(abs, "utf8");
   }
   function tokens(): { tokens: number; contextWindow: number } {
     const u = lastCtx?.getContextUsage?.();
@@ -115,6 +158,12 @@ export default function (pi: ExtensionAPI) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
         if (line.trim()) onHubMessage(line, ctx);
       }
+      // Consume complete frames first; only an oversized un-framed remainder is a problem.
+      if (buf.length > MAX_MESSAGE_BYTES) {
+        audit(`DROP oversized frame from hub (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+        buf = "";
+        try { hub?.destroy(); } catch { /* */ }
+      }
     });
     const lost = () => {
       if (connected) audit("HUB CONNECTION LOST");
@@ -145,8 +194,13 @@ export default function (pi: ExtensionAPI) {
     } else if (m.t === "registered") {
       audit(`ONLINE ${selfName}`);
     } else if (m.t === "deliver") {
-      // inbound prompt from a peer
-      inbound.set(m.msg_id, { from: m.from, hops: m.hops });
+      // inbound prompt from a peer (routed by the hub)
+      if (!MSG_ID_RE.test(m.msg_id ?? "") || typeof m.from !== "string" || typeof m.text !== "string") {
+        audit(`REJECT malformed deliver from ${String(m.from)}`);
+        return;
+      }
+      if (inbound.size >= MAX_INBOUND && !inbound.has(m.msg_id)) evictOldestInbound();
+      inbound.set(m.msg_id, { from: m.from, hops: Number.isSafeInteger(m.hops) && m.hops >= 1 ? m.hops : 1, ts: Date.now() });
       audit(`RECV ${m.msg_id} ${m.from}->${selfName} hops=${m.hops}`);
       const wrapped =
         `[coms-net] Message from peer "${m.from}". Your reply will be sent back to them automatically.\n\n` +
@@ -154,6 +208,7 @@ export default function (pi: ExtensionAPI) {
       pi.sendUserMessage(wrapped, { deliverAs: "followUp" });
     } else if (m.t === "response") {
       // reply to something we sent
+      if (!MSG_ID_RE.test(m.msg_id ?? "")) return;
       const p = pending.get(m.msg_id);
       audit(`REPLY ${m.msg_id} ${m.from}->${selfName}${m.isError ? " ERR" : ""}`);
       if (p) {
@@ -297,8 +352,7 @@ export default function (pi: ExtensionAPI) {
       lastCtx = ctx;
       let body = params.text ?? "";
       if (params.payload_file) {
-        const abs = path.resolve(ctx.cwd, params.payload_file.replace(/^@/, ""));
-        body = `${body ? body + "\n\n" : ""}${fs.readFileSync(abs, "utf8")}`;
+        body = `${body ? body + "\n\n" : ""}${readPayloadFile(ctx.cwd, params.payload_file)}`;
       }
       if (!body.trim()) throw new Error("coms_net_send needs text or a non-empty payload_file");
       const msg_id = routePrompt(params.target, body);
@@ -401,6 +455,7 @@ export default function (pi: ExtensionAPI) {
       const t = tokens();
       send({ t: "ping", name: selfName, tokens: t.tokens, contextWindow: t.contextWindow });
       renderWidget();
+      sweepInbound();
     }, HEARTBEAT_MS);
   });
 

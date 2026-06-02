@@ -46,6 +46,22 @@ const HEARTBEAT_MS = 10_000;
 // Replies larger than this are written to a file and only a pointer is returned.
 const INLINE_REPLY_LIMIT = Number(process.env.PI_COMS_INLINE_LIMIT ?? 6_000);
 
+// Hardening limits (all env-overridable).
+// Drop a connection whose un-framed line (no newline yet) exceeds this, so a peer
+// can't exhaust memory with one giant line before JSON.parse ever runs.
+const MAX_MESSAGE_BYTES = Number(process.env.PI_COMS_MAX_MESSAGE_BYTES ?? 10 * 1024 * 1024);
+// Cap receiver-side in-flight prompts and expire ones never replied to, so a peer
+// that sends and disconnects can't grow `inbound` without bound.
+const MAX_INBOUND = Number(process.env.PI_COMS_MAX_INBOUND ?? 1_000);
+const INBOUND_TTL_MS = Number(process.env.PI_COMS_INBOUND_TTL_MS ?? 60 * 60 * 1000);
+// payload_file is resolved against cwd and must stay inside it (override with =1),
+// with a size ceiling — it's an LLM-callable arbitrary-file read otherwise.
+const PAYLOAD_FILE_MAX_BYTES = Number(process.env.PI_COMS_PAYLOAD_FILE_MAX_BYTES ?? 10 * 1024 * 1024);
+const ALLOW_PAYLOAD_OUTSIDE_CWD = process.env.PI_COMS_ALLOW_PAYLOAD_OUTSIDE_CWD === "1";
+// We mint ids as "msg_" + 10 lowercase hex chars. Reject anything else at ingress so
+// a peer can't poison the maps or smuggle path separators into a payload filename.
+const MSG_ID_RE = /^msg_[0-9a-f]{10}$/;
+
 // ---------------------------------------------------------------------------
 // Envelope types sent over the wire (newline-delimited JSON)
 // ---------------------------------------------------------------------------
@@ -85,8 +101,8 @@ export default function (pi: ExtensionAPI) {
 
   // sender side: msg_id -> pending reply we are awaiting
   const pending = new Map<string, Pending>();
-  // receiver side: msg_id -> who asked + hop count, set when a prompt arrives
-  const inbound = new Map<string, { from: string; hops: number }>();
+  // receiver side: msg_id -> who asked + hop count + arrival time, set when a prompt arrives
+  const inbound = new Map<string, { from: string; hops: number; ts: number }>();
 
   pi.registerFlag("coms-name", { description: "Peer name in the coms pool", type: "string" });
   pi.registerFlag("coms-purpose", { description: "One-line role shown to peers", type: "string" });
@@ -135,6 +151,41 @@ export default function (pi: ExtensionAPI) {
     try { fs.appendFileSync(auditLog, `${new Date().toISOString()} ${line}\n`); } catch { /* best effort */ }
   }
 
+  // Drop inbound prompts that were never replied to within the TTL (sender vanished
+  // or its marker never came back), and evict the oldest when at the size cap.
+  function sweepInbound() {
+    const now = Date.now();
+    for (const [id, rec] of inbound) if (now - rec.ts > INBOUND_TTL_MS) { inbound.delete(id); audit(`EXPIRE ${id}`); }
+  }
+  function evictOldestInbound() {
+    let oldestId: string | undefined;
+    let oldestTs = Infinity;
+    for (const [id, rec] of inbound) if (rec.ts < oldestTs) { oldestTs = rec.ts; oldestId = id; }
+    if (oldestId) { inbound.delete(oldestId); audit(`EVICT ${oldestId} (inbound cap ${MAX_INBOUND})`); }
+  }
+
+  // Read a payload_file for coms_send, confined to the project dir and size-capped.
+  // Without this an LLM steered by a peer's prompt could read arbitrary local files.
+  function readPayloadFile(cwd: string, spec: string): string {
+    // realpath BOTH sides so a symlink inside cwd can't point the read outside it
+    // (path.resolve alone doesn't follow links), and so a symlinked cwd still matches.
+    let root: string;
+    let abs: string;
+    try {
+      root = fs.realpathSync(path.resolve(cwd));
+      abs = fs.realpathSync(path.resolve(root, spec.replace(/^@/, "")));
+    } catch {
+      throw new Error("payload_file not found or unreadable.");
+    }
+    if (!ALLOW_PAYLOAD_OUTSIDE_CWD && abs !== root && !abs.startsWith(root + path.sep)) {
+      throw new Error("payload_file must be inside the project directory. Set PI_COMS_ALLOW_PAYLOAD_OUTSIDE_CWD=1 to override.");
+    }
+    const st = fs.statSync(abs);
+    if (!st.isFile()) throw new Error("payload_file must be a regular file.");
+    if (st.size > PAYLOAD_FILE_MAX_BYTES) throw new Error(`payload_file too large (${st.size}B > ${PAYLOAD_FILE_MAX_BYTES}B limit).`);
+    return fs.readFileSync(abs, "utf8");
+  }
+
   function writeSelf(ctx?: ExtensionContext) {
     if (!self) return;
     if (ctx) {
@@ -168,6 +219,13 @@ export default function (pi: ExtensionAPI) {
           buf = buf.slice(nl + 1);
           if (line.trim()) handleEnvelope(line, sock);
         }
+        // Consume complete frames first; only an oversized UNFRAMED remainder
+        // (a single line with no newline) is the memory-exhaustion case.
+        if (buf.length > MAX_MESSAGE_BYTES) {
+          audit(`DROP oversized frame (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+          buf = "";
+          try { sock.destroy(); } catch { /* */ }
+        }
       });
       sock.on("error", () => { /* peer vanished mid-stream */ });
     });
@@ -184,13 +242,20 @@ export default function (pi: ExtensionAPI) {
 
     if (env.type === "prompt") {
       // ---- we are the receiver ----
+      // Reject malformed envelopes before they touch the maps or the followUp queue.
+      if (!MSG_ID_RE.test(env.msg_id ?? "") || typeof env.from !== "string" || typeof env.text !== "string" || !Number.isSafeInteger(env.hops) || env.hops < 1) {
+        audit(`REJECT malformed prompt from ${String(env.from)}`);
+        return;
+      }
       if (env.hops > MAX_HOPS) {
         audit(`DROP ${env.msg_id} ${env.from} hops=${env.hops}`);
         sendTo(env.from, { type: "response", msg_id: env.msg_id, from: self!.name, text: `Dropped: hop limit ${MAX_HOPS} exceeded`, isError: true });
         return;
       }
+      // Bound memory: evict the oldest in-flight prompt if we're at the cap.
+      if (inbound.size >= MAX_INBOUND && !inbound.has(env.msg_id)) evictOldestInbound();
       try { sock.write(JSON.stringify({ type: "ack", msg_id: env.msg_id } as Envelope) + "\n"); } catch { /* */ }
-      inbound.set(env.msg_id, { from: env.from, hops: env.hops });
+      inbound.set(env.msg_id, { from: env.from, hops: env.hops, ts: Date.now() });
       audit(`RECV ${env.msg_id} ${env.from}->${self!.name} hops=${env.hops}`);
 
       const wrapped =
@@ -200,10 +265,12 @@ export default function (pi: ExtensionAPI) {
       // followUp: queue until idle so it becomes the next processed prompt
       pi.sendUserMessage(wrapped, { deliverAs: "followUp" });
     } else if (env.type === "ack") {
+      if (!MSG_ID_RE.test(env.msg_id ?? "")) return;
       // handled inline by the sender's connection logic (see sendPrompt)
       pi.events.emit(`coms:ack:${env.msg_id}`, {});
     } else if (env.type === "response") {
       // ---- we are the sender, reply has arrived ----
+      if (!MSG_ID_RE.test(env.msg_id ?? "")) return;
       audit(`REPLY ${env.msg_id} ${env.from}->${self!.name}${env.isError ? " ERR" : ""}`);
       const p = pending.get(env.msg_id);
       if (p) {
@@ -283,6 +350,8 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* ignore */ }
         }
+        // a peer we dialed can't stream an unbounded un-framed ack reply
+        if (cbuf.length > MAX_MESSAGE_BYTES) { cbuf = ""; try { c.destroy(); } catch { /* */ } }
       });
       c.on("error", (err) => { clearTimeout(ackTimer); reject(err); });
     });
@@ -417,8 +486,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       let body = params.text ?? "";
       if (params.payload_file) {
-        const abs = path.resolve(ctx.cwd, params.payload_file.replace(/^@/, ""));
-        body = `${body ? body + "\n\n" : ""}${fs.readFileSync(abs, "utf8")}`;
+        body = `${body ? body + "\n\n" : ""}${readPayloadFile(ctx.cwd, params.payload_file)}`;
       }
       if (!body.trim()) throw new Error("coms_send requires text or a non-empty payload_file");
       const msg_id = await sendPrompt(params.target, body, nextHops());
@@ -530,7 +598,7 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx);
     audit(`ONLINE ${self.name} pid=${self.pid}`);
 
-    heartbeat = setInterval(() => { writeSelf(ctx); renderWidget(ctx); }, HEARTBEAT_MS);
+    heartbeat = setInterval(() => { writeSelf(ctx); renderWidget(ctx); sweepInbound(); }, HEARTBEAT_MS);
   });
 
   pi.on("turn_end", async (_event, ctx) => { writeSelf(ctx); renderWidget(ctx); });

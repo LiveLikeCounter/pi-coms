@@ -28,6 +28,28 @@ const MAX_HOPS = Number(process.env.PI_COMS_NET_MAX_HOPS ?? 5);
 const HEARTBEAT_MS = 10_000;
 const STALE_AFTER = HEARTBEAT_MS * 3;
 
+// Hardening limits (all env-overridable).
+// Drop a connection whose un-framed line exceeds this (memory-exhaustion guard).
+const MAX_MESSAGE_BYTES = Number(process.env.PI_COMS_NET_MAX_MESSAGE_BYTES ?? 10 * 1024 * 1024);
+// Per-connection token bucket throttling `send`/`register`: capacity allows a burst
+// (e.g. one broadcast fanning to many peers), refill caps the sustained rate so a
+// compromised peer can't flood the pool. ping/reply pass freely.
+const RATE_BURST = Number(process.env.PI_COMS_NET_RATE_BURST ?? 100);
+const RATE_REFILL_PER_SEC = Number(process.env.PI_COMS_NET_RATE_REFILL ?? 50);
+const MSG_ID_RE = /^msg_[0-9a-f]{10}$/;
+
+interface Bound { name?: string; tokens: number; last: number; }
+
+// Refill then spend one token; false means the connection is over its rate budget.
+function takeToken(bound: Bound): boolean {
+  const now = Date.now();
+  bound.tokens = Math.min(RATE_BURST, bound.tokens + ((now - bound.last) / 1000) * RATE_REFILL_PER_SEC);
+  bound.last = now;
+  if (bound.tokens < 1) return false;
+  bound.tokens -= 1;
+  return true;
+}
+
 function projectKey(cwd: string): string {
   const base = path.basename(cwd).replace(/[^a-zA-Z0-9_-]/g, "-");
   const hash = crypto.createHash("sha1").update(cwd).digest("hex").slice(0, 8);
@@ -85,12 +107,14 @@ function sendToClient(name: string, obj: unknown): boolean {
   try { c.conn.write(JSON.stringify(obj) + "\n"); return true; } catch { return false; }
 }
 
-function onMessage(raw: string, conn: net.Socket, bound: { name?: string }) {
+function onMessage(raw: string, conn: net.Socket, bound: Bound) {
   let m: any;
   try { m = JSON.parse(raw); } catch { return; }
 
   switch (m.t) {
     case "register": {
+      if (typeof m.name !== "string" || !m.name) return;
+      if (!takeToken(bound)) { audit(`RATE-LIMIT ${m.name} register`); return; }
       const record: PeerRecord = {
         name: m.name, model: m.model ?? "unknown", purpose: m.purpose ?? "",
         color: m.color ?? "#36F9F6", pid: m.pid ?? 0,
@@ -116,7 +140,19 @@ function onMessage(raw: string, conn: net.Socket, bound: { name?: string }) {
       break;
     }
     case "send": {
-      const hops = (m.hops ?? 1) as number;
+      if (!MSG_ID_RE.test(m.msg_id ?? "") || typeof m.from !== "string" || typeof m.to !== "string" || typeof m.text !== "string") {
+        audit(`REJECT malformed send from ${String(m.from)}`);
+        return;
+      }
+      // a client may only send as its own registered identity (anti-spoofing)
+      if (!bound.name || m.from !== bound.name) { audit(`REJECT send from=${m.from} bound=${bound.name ?? "?"}`); return; }
+      if (!takeToken(bound)) {
+        // surface the drop so the sender's await resolves instead of hanging to its timeout
+        audit(`RATE-LIMIT ${bound.name} send`);
+        sendToClient(m.from, { t: "response", msg_id: m.msg_id, from: m.to, text: "Dropped: hub rate limit exceeded", isError: true });
+        return;
+      }
+      const hops = Number.isSafeInteger(m.hops) && m.hops >= 1 ? m.hops : 1;
       if (hops > MAX_HOPS) {
         audit(`DROP ${m.msg_id} ${m.from}->${m.to} hops=${hops}`);
         sendToClient(m.from, { t: "response", msg_id: m.msg_id, from: m.to, text: `Dropped: hop limit ${MAX_HOPS} exceeded`, isError: true });
@@ -130,6 +166,12 @@ function onMessage(raw: string, conn: net.Socket, bound: { name?: string }) {
       break;
     }
     case "reply": {
+      if (!MSG_ID_RE.test(m.msg_id ?? "") || typeof m.from !== "string" || typeof m.to !== "string") {
+        audit(`REJECT malformed reply from ${String(m.from)}`);
+        return;
+      }
+      // a client may only reply as its own registered identity (anti-spoofing)
+      if (!bound.name || m.from !== bound.name) { audit(`REJECT reply from=${m.from} bound=${bound.name ?? "?"}`); return; }
       audit(`REPLY ${m.msg_id} ${m.from}->${m.to}${m.isError ? " ERR" : ""}`);
       sendToClient(m.to, { t: "response", msg_id: m.msg_id, from: m.from, text: m.text, isError: m.isError });
       break;
@@ -140,7 +182,7 @@ function onMessage(raw: string, conn: net.Socket, bound: { name?: string }) {
 }
 
 const server = net.createServer((conn) => {
-  const bound: { name?: string } = {};
+  const bound: Bound = { tokens: RATE_BURST, last: Date.now() };
   let buf = "";
   conn.on("data", (chunk) => {
     buf += chunk.toString("utf8");
@@ -148,6 +190,12 @@ const server = net.createServer((conn) => {
     while ((nl = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
       if (line.trim()) onMessage(line, conn, bound);
+    }
+    // Consume complete frames first; only an oversized un-framed remainder is the DoS case.
+    if (buf.length > MAX_MESSAGE_BYTES) {
+      audit(`DROP oversized frame from ${bound.name ?? "?"} (${buf.length}B > ${MAX_MESSAGE_BYTES}B)`);
+      buf = "";
+      try { conn.destroy(); } catch { /* */ }
     }
   });
   const drop = () => {
